@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:mostro_mobile/core/app_theme.dart';
+import 'package:mostro_mobile/core/automation/automation_id.dart';
+import 'package:mostro_mobile/core/automation/automation_ids.dart';
 import 'package:mostro_mobile/generated/l10n.dart';
 
 class AddLightningInvoiceWidget extends StatefulWidget {
@@ -11,6 +13,9 @@ class AddLightningInvoiceWidget extends StatefulWidget {
   final String fiatCode;
   final String orderId;
 
+  /// Replaces the built-in heading text when provided (see [InvoiceHeader]).
+  final Widget? header;
+
   const AddLightningInvoiceWidget({
     super.key,
     required this.controller,
@@ -20,6 +25,7 @@ class AddLightningInvoiceWidget extends StatefulWidget {
     required this.fiatAmount,
     required this.fiatCode,
     required this.orderId,
+    this.header,
   });
 
   @override
@@ -34,19 +40,20 @@ class _AddLightningInvoiceWidgetState extends State<AddLightningInvoiceWidget> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            S.of(context)!.pleaseEnterLightningInvoiceFor(
-                  widget.amount.toString(),
-                  widget.fiatCode,
-                  widget.fiatAmount,
-                  widget.orderId,
+          widget.header ??
+              Text(
+                S.of(context)!.pleaseEnterLightningInvoiceFor(
+                      widget.amount.toString(),
+                      widget.fiatCode,
+                      widget.fiatAmount,
+                      widget.orderId,
+                    ),
+                style: const TextStyle(
+                  color: AppTheme.textPrimary,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w500,
                 ),
-            style: const TextStyle(
-              color: AppTheme.textPrimary,
-              fontSize: 16,
-              fontWeight: FontWeight.w500,
-            ),
-          ),
+              ),
           const SizedBox(height: 16),
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
@@ -70,7 +77,7 @@ class _AddLightningInvoiceWidgetState extends State<AddLightningInvoiceWidget> {
                 alignLabelWithHint: true,
               ),
               maxLines: 6,
-            ),
+            ).withAutomationId(AutomationIds.invoiceText),
           ),
           const SizedBox(height: 16),
           Row(
@@ -88,7 +95,7 @@ class _AddLightningInvoiceWidgetState extends State<AddLightningInvoiceWidget> {
                     ),
                     textAlign: TextAlign.center,
                   ),
-                ),
+                ).withAutomationId(AutomationIds.invoiceCancel),
               ),
               const SizedBox(width: 12),
               Expanded(
@@ -111,7 +118,7 @@ class _AddLightningInvoiceWidgetState extends State<AddLightningInvoiceWidget> {
                       fontWeight: FontWeight.w500,
                     ),
                   ),
-                ),
+                ).withAutomationId(AutomationIds.invoiceSubmit),
               ),
             ],
           ),

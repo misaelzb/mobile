@@ -2,9 +2,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 import 'package:mostro_mobile/core/app_theme.dart';
+import 'package:mostro_mobile/core/automation/automation_id.dart';
+import 'package:mostro_mobile/core/automation/automation_ids.dart';
 import 'package:mostro_mobile/features/order/providers/order_notifier_provider.dart';
 import 'package:mostro_mobile/features/order/widgets/order_app_bar.dart';
 import 'package:mostro_mobile/features/wallet/providers/nwc_provider.dart';
+import 'package:mostro_mobile/data/models/enums/role.dart';
+import 'package:mostro_mobile/shared/providers/session_notifier_provider.dart';
+import 'package:mostro_mobile/shared/widgets/invoice_header.dart';
 import 'package:mostro_mobile/shared/widgets/nwc_payment_widget.dart';
 import 'package:mostro_mobile/shared/widgets/pay_lightning_invoice_widget.dart';
 import 'package:mostro_mobile/generated/l10n.dart';
@@ -36,12 +41,32 @@ class _PayLightningInvoiceScreenState
 
     final nwcState = ref.watch(nwcProvider);
     final isNwcConnected = nwcState.status == NwcStatus.connected;
-    final showNwcPayment = isNwcConnected && !_manualMode && lnInvoice.isNotEmpty;
+    final showNwcPayment =
+        isNwcConnected && !_manualMode && lnInvoice.isNotEmpty;
+
+    // Trade summary shown by every flow: trade type, who took the order,
+    // amounts, order id and the counterpart reputation (when received).
+    // Paying the hold invoice always means the user is the seller, but not
+    // always the maker: taking a buy order lands here too.
+    final session = ref.watch(sessionProvider(widget.orderId));
+    final header = InvoiceHeader(
+      userIsSeller: session?.role == null || session!.role == Role.seller,
+      sats: sats,
+      fiatAmount: fiatAmount,
+      fiatCode: fiatCode,
+      orderId: widget.orderId,
+      takenByCounterpart: counterpartTookYourOrder(
+        kind: orderState.order?.kind,
+        role: session?.role,
+        status: orderState.status,
+      ),
+      reputation: orderState.peerReputation,
+    );
 
     return Scaffold(
       backgroundColor: AppTheme.dark1,
       appBar: OrderAppBar(title: S.of(context)!.payLightningInvoice),
-      body: Padding(
+      body: SingleChildScrollView(
         padding: EdgeInsets.fromLTRB(
           16,
           16,
@@ -53,17 +78,15 @@ class _PayLightningInvoiceScreenState
           children: [
             if (showNwcPayment) ...[
               // NWC auto-payment flow
-              Text(
-                S.of(context)!.payInvoiceToContinue(
-                  sats.toString(),
-                  fiatCode,
-                  fiatAmount,
-                  widget.orderId,
-                ),
-                style: const TextStyle(color: AppTheme.cream1, fontSize: 18),
-                textAlign: TextAlign.center,
-              ),
+              header,
               const SizedBox(height: 24),
+              // Automation readout: the invoice being paid, so a black-box
+              // driver can correlate the payment by hash without reading the
+              // QR code. Invisible; screen readers get the invoice string.
+              const SizedBox(width: 1, height: 1).withAutomationId(
+                  AutomationIds.payInvoiceText,
+                  merge: false,
+                  label: lnInvoice),
               NwcPaymentWidget(
                 lnInvoice: lnInvoice,
                 sats: sats,
@@ -90,7 +113,7 @@ class _PayLightningInvoiceScreenState
                       backgroundColor: Colors.red,
                     ),
                     child: Text(S.of(context)!.cancel),
-                  ),
+                  ).withAutomationId(AutomationIds.payCancel),
                 ],
               ),
             ] else ...[
@@ -108,6 +131,7 @@ class _PayLightningInvoiceScreenState
                 fiatAmount: fiatAmount,
                 fiatCode: fiatCode,
                 orderId: widget.orderId,
+                header: header,
               ),
             ],
           ],
