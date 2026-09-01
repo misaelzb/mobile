@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -9,7 +10,6 @@ import 'package:mostro_mobile/services/logger_service.dart';
 import 'package:mostro_mobile/features/chat/providers/chat_room_providers.dart';
 import 'package:mostro_mobile/features/disputes/notifiers/dispute_chat_notifier.dart';
 import 'package:mostro_mobile/features/subscriptions/subscription_type.dart';
-import 'package:mostro_mobile/features/trades/providers/trades_provider.dart';
 import 'package:mostro_mobile/shared/providers/background_service_provider.dart';
 import 'package:mostro_mobile/shared/providers/mostro_service_provider.dart';
 import 'package:mostro_mobile/shared/providers/order_repository_provider.dart';
@@ -18,33 +18,64 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 class LifecycleManager extends WidgetsBindingObserver {
   final Ref ref;
+  final bool _isMobilePlatform;
   bool _isInBackground = false;
+  Timer? _backgroundDebounce;
 
-  LifecycleManager(this.ref) {
+  /// A background switch is expensive (unsubscribe everything, start the
+  /// background service) and the matching resume redoes cold-start work, so
+  /// it only runs once the app has stayed away for this long. A quick resume
+  /// cancels it.
+  static const Duration backgroundDebounce = Duration(seconds: 2);
+
+  @visibleForTesting
+  bool get isInBackground => _isInBackground;
+
+  LifecycleManager(this.ref, {bool? isMobilePlatform})
+      : _isMobilePlatform =
+            isMobilePlatform ?? (Platform.isAndroid || Platform.isIOS) {
     WidgetsBinding.instance.addObserver(this);
   }
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) async {
-    if (Platform.isAndroid || Platform.isIOS) {
-      switch (state) {
-        case AppLifecycleState.resumed:
-          // App is in foreground
-          if (_isInBackground) {
-            await _switchToForeground();
-          }
-          break;
-        case AppLifecycleState.paused:
-        case AppLifecycleState.inactive:
-        case AppLifecycleState.detached:
-          // App is in background
-          if (!_isInBackground) {
-            await _switchToBackground();
-          }
-          break;
-        default:
-          break;
-      }
+    if (!_isMobilePlatform) return;
+    switch (state) {
+      case AppLifecycleState.resumed:
+        _backgroundDebounce?.cancel();
+        _backgroundDebounce = null;
+        if (_isInBackground) {
+          await _switchToForeground();
+        }
+        break;
+      case AppLifecycleState.paused:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.detached:
+        // Schedule, don't switch: paused can be a blip (app switcher glance).
+        if (!_isInBackground && _backgroundDebounce == null) {
+          _backgroundDebounce = Timer(backgroundDebounce, () {
+            _backgroundDebounce = null;
+            if (!_isInBackground) {
+              _switchToBackground();
+            }
+          });
+        }
+        break;
+      case AppLifecycleState.inactive:
+        // Fires for the notification shade, permission/biometric dialogs and
+        // the app switcher on Android. Never a reason to tear down
+        // subscriptions and start the background service.
+        //
+        // A pending switch is cancelled here, not only on `resumed`: the
+        // return path is paused -> hidden -> inactive -> resumed, and the app
+        // can sit in `inactive` past the deadline behind a permission or
+        // biometric dialog. Letting the timer fire there would run the whole
+        // teardown while the app is already coming back, which is exactly the
+        // churn the debounce exists to avoid. Nothing is stranded by this:
+        // leaving `inactive` outwards delivers `hidden`, which reschedules.
+        _backgroundDebounce?.cancel();
+        _backgroundDebounce = null;
+        break;
     }
   }
 
@@ -66,7 +97,10 @@ class LifecycleManager extends WidgetsBindingObserver {
       await Future.delayed(const Duration(milliseconds: 500));
 
       final subscriptionManager = ref.read(subscriptionManagerProvider);
-      subscriptionManager.subscribeAll();
+      // resume() rather than subscribeAll(): the relay-list subscription is
+      // not derived from sessions, so subscribeAll() alone cannot bring it
+      // back after _switchToBackground() tore it down.
+      subscriptionManager.resume();
 
       // Reinitialize the mostro service
       logger.i("Reinitializing MostroService");
@@ -88,10 +122,6 @@ class LifecycleManager extends WidgetsBindingObserver {
       // never re-reads storage nor re-opens its relay subscription on its own
       logger.i("Reloading dispute chats");
       ref.invalidate(disputeChatNotifierProvider);
-
-      // Force UI update for trades
-      logger.i("Invalidating providers to refresh UI");
-      ref.invalidate(filteredTradesWithOrderStateProvider);
 
       logger.i("Foreground transition complete");
     } catch (e) {
@@ -132,7 +162,7 @@ class LifecycleManager extends WidgetsBindingObserver {
           logger.e('Failed to persist background filters: $e');
         }
 
-        subscriptionManager.unsubscribeAll();
+        subscriptionManager.suspend();
 
         // Transfer active subscriptions to background service
         final backgroundService = ref.read(backgroundServiceProvider);
@@ -142,6 +172,9 @@ class LifecycleManager extends WidgetsBindingObserver {
         backgroundService.subscribe(activeFilters);
       } else {
         _isInBackground = true;
+        // Still suspend: a pending relay sync retry must not re-open a REQ
+        // while the background service owns connectivity.
+        subscriptionManager.suspend();
         logger.w("No active subscriptions to transfer to background service");
         // Clear any previously persisted filters to prevent stale subscriptions
         // on service revival
@@ -161,6 +194,7 @@ class LifecycleManager extends WidgetsBindingObserver {
   }
 
   void dispose() {
+    _backgroundDebounce?.cancel();
     WidgetsBinding.instance.removeObserver(this);
   }
 }

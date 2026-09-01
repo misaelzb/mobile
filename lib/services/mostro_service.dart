@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'package:collection/collection.dart';
 import 'package:dart_nostr/dart_nostr.dart';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:mostro_mobile/services/chat_cursor_store.dart';
 import 'package:mostro_mobile/services/logger_service.dart';
 import 'package:mostro_mobile/data/enums.dart';
 import 'package:mostro_mobile/data/models.dart';
@@ -105,22 +107,110 @@ class MostroService {
     return false;
   }
 
+  /// Event ids currently inside [_onData], so copies of the same event racing
+  /// in from several relays don't get processed twice while the durable
+  /// marker below is not yet written.
+  final Set<String> _inFlightEventIds = <String>{};
+
+  /// Durably marks [event] as fully handled. Written only AFTER processing
+  /// completes (or the event is conclusively not for this consumer): the
+  /// background service suppresses its push notification for any id present
+  /// in this store, and a reservation written *before* processing poisoned
+  /// the event forever when the first attempt failed mid-way (session not
+  /// loaded yet, decrypt error, process death between the reservation and the
+  /// message write) — the daemon's message then never notified, was skipped
+  /// by every later replay, and the order sat at a stale status across
+  /// restarts.
+  Future<void> _markEventProcessed(NostrEvent event) async {
+    final eventId = event.id!;
+    await ref.read(eventStorageProvider).putItem(eventId, {
+      'id': eventId,
+      'created_at': event.createdAt!.millisecondsSinceEpoch ~/ 1000,
+    });
+    // Only once the durable marker is written may the cursor move: a failed
+    // putItem leaves the event unmarked, and a cursor advanced past it would
+    // drop it from every later replay.
+    _advanceOrdersCursor(event);
+  }
+
+  /// Events seen but deliberately left unmarked (no matching session yet, or
+  /// a failure mid-processing), keyed by id. They still need replaying, so
+  /// the shared node cursor must not move past the oldest of them.
+  final Map<String, DateTime> _retryableEvents = <String, DateTime>{};
+
+  /// How long an unmarked event holds the cursor back. Bounded so an event
+  /// that can never be processed (a trade key whose session is gone) cannot
+  /// freeze the cursor — and with it the replay window — forever.
+  static const _retryHoldWindow = Duration(hours: 1);
+
+  /// Records an event that was not marked processed, so [_advanceOrdersCursor]
+  /// keeps the replay window covering it.
+  void _holdEventForRetry(NostrEvent event) {
+    if (event.kind != 14 || event.id == null || event.createdAt == null) return;
+    _pruneExpiredHolds();
+    _retryableEvents[event.id!] = event.createdAt!;
+  }
+
+  /// Drops holds older than [_retryHoldWindow]. Runs on both the hold and the
+  /// advance path: pruning only when an event is accepted would let the map
+  /// grow unpruned through a run in which every event is held.
+  void _pruneExpiredHolds() {
+    _retryableEvents.removeWhere(
+      (_, at) => at.isBefore(DateTime.now().subtract(_retryHoldWindow)),
+    );
+  }
+
+  /// Ids currently holding the cursor back.
+  @visibleForTesting
+  Set<String> get debugHeldEventIds => _retryableEvents.keys.toSet();
+
+  /// Advances the orders `since` cursor for a processed event.
+  ///
+  /// Only kind 14 counts: the cursor feeds the NIP-44 filter, and gift wrap
+  /// (1059) timestamps are randomized, so letting them move it would push
+  /// `since` past kind-14 messages once the node switches transport.
+  ///
+  /// The cursor is a contiguous watermark: it never moves past an event still
+  /// awaiting a retry, otherwise one trade's newer response would evict
+  /// another trade's older, still-unprocessed one from the replay window.
+  void _advanceOrdersCursor(NostrEvent event) {
+    _retryableEvents.remove(event.id);
+    if (event.kind != 14) return;
+    final accepted = event.createdAt!;
+    _pruneExpiredHolds();
+    final blocked = _retryableEvents.values.any((at) => !at.isAfter(accepted));
+    if (blocked) return;
+    unawaited(
+      ref
+          .read(ordersCursorStoreProvider)
+          .advance(_settings.mostroPublicKey, accepted),
+    );
+  }
+
   Future<void> _onData(NostrEvent event) async {
+    final eventId = event.id!;
+    if (!_inFlightEventIds.add(eventId)) return;
+    try {
+      await _processEvent(event);
+    } finally {
+      _inFlightEventIds.remove(eventId);
+    }
+  }
+
+  Future<void> _processEvent(NostrEvent event) async {
     final eventStore = ref.read(eventStorageProvider);
 
     if (await eventStore.hasItem(event.id!)) return;
-
-    // Reserve event ID immediately to prevent duplicate processing from multiple relays
-    await eventStore.putItem(event.id!, {
-      'id': event.id,
-      'created_at': event.createdAt!.millisecondsSinceEpoch ~/ 1000,
-    });
 
     final sessions = ref.read(sessionNotifierProvider);
     final matchingSession = sessions.firstWhereOrNull(
       (s) => s.tradeKey.public == event.recipient,
     );
     if (matchingSession == null) {
+      // Deliberately NOT marked processed: the session may simply not exist
+      // yet (startup ordering, a child order being linked), and a later
+      // replay must be able to retry this event.
+      _holdEventForRetry(event);
       logger.w('No matching session found for recipient: ${event.recipient}');
       return;
     }
@@ -144,13 +234,17 @@ class MostroService {
         decryptedId = decryptedEvent.id;
       }
 
-      if (content == null) return;
+      if (content == null) {
+        _holdEventForRetry(event);
+        return;
+      }
 
       final result = jsonDecode(content);
 
       // Ensure result is a non-empty List before accessing elements
       if (result is! List || result.isEmpty) {
         logger.w('Received empty or invalid payload, skipping');
+        await _markEventProcessed(event);
         return;
       }
 
@@ -158,12 +252,14 @@ class MostroService {
       // via its own adminSharedKey subscription
       if (NostrUtils.isDmPayload(result[0])) {
         logger.i('Skipping dispute chat message (handled by DisputeChatNotifier)');
+        await _markEventProcessed(event);
         return;
       }
 
       // Skip restore-specific payloads that arrive as historical events due to temporary subscription
       if (result[0] is Map &&
           _isRestorePayload(result[0] as Map<String, dynamic>)) {
+        await _markEventProcessed(event);
         return;
       }
 
@@ -183,7 +279,17 @@ class MostroService {
       );
 
       await _maybeLinkChildOrder(msg, matchingSession);
+
+      // Only now is the event durably done: a crash anywhere above leaves it
+      // unmarked, so the next replay retries it (addMessage is idempotent —
+      // same key, same message).
+      await _markEventProcessed(event);
     } catch (e) {
+      // Not marked processed: a later replay gets another chance at a
+      // transient failure. A permanently undecryptable event costs one
+      // decrypt attempt per replay, which the dedup above bounds to one
+      // relay copy at a time.
+      _holdEventForRetry(event);
       logger.e('Error processing event', error: e);
     }
   }
@@ -353,8 +459,12 @@ class MostroService {
   Future<void> publishOrder(MostroMessage order) async {
     final session = await _getSession(order);
 
-    // Read PoW difficulty from the connected Mostro instance (kind 38385)
-    final mostroInstance = ref.read(orderRepositoryProvider).mostroInstance;
+    // Read PoW difficulty and protocol version from the connected Mostro
+    // instance (kind 38385), waiting for it if the info event has not landed
+    // yet: an outbound envelope sent on the transport the node does not speak
+    // is dropped silently and never retried.
+    final mostroInstance =
+        await ref.read(orderRepositoryProvider).awaitMostroInstance();
     final difficulty = mostroInstance?.pow ?? 0;
     if (mostroInstance == null) {
       logger.w(
@@ -364,7 +474,8 @@ class MostroService {
     }
 
     // Route through the transport advertised by the connected node (§5 Phase
-    // B). v1 nodes (default) keep the gift-wrap path byte-for-byte.
+    // B). Nodes that advertise protocol_version 1 keep the gift-wrap path
+    // byte-for-byte.
     final event = await order.wrapForTransport(
       protocolVersion: mostroInstance?.protocolVersion,
       tradeKey: session.tradeKey,

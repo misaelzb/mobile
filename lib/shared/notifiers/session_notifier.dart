@@ -15,6 +15,7 @@ import 'package:mostro_mobile/data/models/order.dart';
 import 'package:mostro_mobile/features/settings/settings.dart';
 import 'package:mostro_mobile/services/push_notification_service.dart';
 import 'package:mostro_mobile/services/logger_service.dart';
+import 'package:mostro_mobile/shared/utils/chat_keys.dart';
 import 'package:mostro_mobile/shared/utils/nostr_utils.dart';
 import 'package:dart_nostr/dart_nostr.dart';
 import 'package:mostro_mobile/data/models/peer.dart';
@@ -53,6 +54,26 @@ class SessionNotifier extends StateNotifier<List<Session>> {
       _settings.sessionExpirationHours ?? Config.sessionExpirationHours;
 
   bool get _isForever => _expirationHours == 0;
+
+  /// Removes the session's key material from the NIP-44 conversation-key
+  /// cache: the trade key conversations (node, seals) and the chat `K_conv`
+  /// self-conversations derived from the peer/admin shared keys. Without this
+  /// the cache would retain secrets of retired sessions until process exit.
+  void _evictSessionKeyMaterial(Session session) {
+    NostrUtils.evictConversationKeysFor(session.tradeKey.private);
+    final sharedKey = session.sharedKey;
+    if (sharedKey != null) {
+      NostrUtils.evictConversationKeysFor(
+        ChatKeys.fromSharedKey(sharedKey).conv.private,
+      );
+    }
+    final adminSharedKey = session.adminSharedKey;
+    if (adminSharedKey != null) {
+      NostrUtils.evictConversationKeysFor(
+        ChatKeys.fromSharedKey(adminSharedKey).conv.private,
+      );
+    }
+  }
 
   Future<void> _cleanupSessionData(Session session) async {
     final orderId = session.orderId;
@@ -111,6 +132,7 @@ class SessionNotifier extends StateNotifier<List<Session>> {
           }
           await _storage.deleteSession(session.orderId!);
           _sessions.remove(session.orderId!);
+          _evictSessionKeyMaterial(session);
           try {
             await _cleanupSessionData(session);
           } catch (e) {
@@ -124,11 +146,59 @@ class SessionNotifier extends StateNotifier<List<Session>> {
   }
 
   void _emitState() {
+    // A session is reachable through three maps and only `_sessions` is keyed
+    // by orderId, so the same order can otherwise surface twice (e.g. a
+    // request-id session whose orderId was assigned by Mostro alongside the
+    // persisted session the restore flow rebuilt for that same order). Every
+    // consumer derived from this state — most visibly the chat list, which
+    // renders one row per session — would then show the order twice.
+    // `_sessions` holds the persisted session, so it wins.
     final combined = <Session>[];
-    combined.addAll(_sessions.values);
-    combined.addAll(_requestIdToSession.values);
-    combined.addAll(_pendingChildSessions.values);
+    final claimedOrderIds = <String>{};
+    for (final session in [
+      ..._sessions.values,
+      ..._requestIdToSession.values,
+      ..._pendingChildSessions.values,
+    ]) {
+      final orderId = session.orderId;
+      if (orderId != null && !claimedOrderIds.add(orderId)) continue;
+      combined.add(session);
+    }
     state = combined;
+  }
+
+  /// Drops every *other* in-memory session that carries [orderId] now that
+  /// [owner] is the session of record for it. Identity is not enough: the
+  /// restore flow rebuilds a brand new [Session] for an order that a pending
+  /// request-id or child session may already point at.
+  void _claimOrderId(String orderId, Session owner) {
+    bool isStale(Session session) =>
+        !identical(session, owner) && session.orderId == orderId;
+
+    void logEviction(Session session) {
+      // A differing trade key means the evicted session held key material no
+      // other map can resolve any more, so surface it rather than dropping it
+      // silently.
+      if (session.tradeKey.public != owner.tradeKey.public) {
+        logger.w(
+          'Evicting session for order $orderId with a different trade key '
+          '(${session.tradeKey.public}); it is no longer resolvable.',
+        );
+      } else {
+        logger.d('Evicted a duplicate in-memory session for order $orderId');
+      }
+    }
+
+    _requestIdToSession.removeWhere((_, session) {
+      if (!isStale(session)) return false;
+      logEviction(session);
+      return true;
+    });
+    _pendingChildSessions.removeWhere((_, session) {
+      if (!isStale(session)) return false;
+      logEviction(session);
+      return true;
+    });
   }
 
   void _scheduleCleanup() {
@@ -144,9 +214,11 @@ class SessionNotifier extends StateNotifier<List<Session>> {
 
     final cutoff = DateTime.now()
         .subtract(Duration(hours: _expirationHours));
-    final expiredSessions = await _storage.getAllSessions();
+    // Iterate the in-memory sessions: getAllSessions() re-decoded every row,
+    // re-running trade-key derivation per session every 30 minutes.
+    final candidates = _sessions.values.toList();
 
-    for (final session in expiredSessions) {
+    for (final session in candidates) {
       if (session.startTime.isBefore(cutoff)) {
         if (await _isActiveSession(session)) {
           logger.i('Skipping cleanup for active session ${session.orderId}');
@@ -154,6 +226,7 @@ class SessionNotifier extends StateNotifier<List<Session>> {
         }
         await _storage.deleteSession(session.orderId!);
         _sessions.remove(session.orderId!);
+        _evictSessionKeyMaterial(session);
         try {
           await _cleanupSessionData(session);
         } catch (e) {
@@ -162,9 +235,11 @@ class SessionNotifier extends StateNotifier<List<Session>> {
       }
     }
 
-    _pendingChildSessions.removeWhere(
-      (_, session) => session.startTime.isBefore(cutoff),
-    );
+    _pendingChildSessions.removeWhere((_, session) {
+      final expired = session.startTime.isBefore(cutoff);
+      if (expired) _evictSessionKeyMaterial(session);
+      return expired;
+    });
 
     _emitState();
   }
@@ -194,6 +269,7 @@ class SessionNotifier extends StateNotifier<List<Session>> {
 
     if (orderId != null) {
       _sessions[orderId] = session;
+      _claimOrderId(orderId, session);
     } else if (requestId != null) {
       _requestIdToSession[requestId] = session;
     }
@@ -206,6 +282,7 @@ class SessionNotifier extends StateNotifier<List<Session>> {
     _sessions[session.orderId!] = session;
     _requestIdToSession.removeWhere((_, value) => identical(value, session));
     _pendingChildSessions.remove(session.tradeKey.public);
+    _claimOrderId(session.orderId!, session);
     await _storage.putSession(session);
     _emitState();
 
@@ -223,6 +300,7 @@ class SessionNotifier extends StateNotifier<List<Session>> {
     if (orderId == null) return;
     _sessions[orderId] = session;
     _requestIdToSession.removeWhere((_, value) => identical(value, session));
+    _claimOrderId(orderId, session);
     _emitState();
   }
 
@@ -289,6 +367,7 @@ class SessionNotifier extends StateNotifier<List<Session>> {
     _sessions.clear();
     _pendingChildSessions.clear();
     _requestIdToSession.clear();
+    NostrUtils.clearConversationKeyCache();
     state = [];
   }
 
@@ -299,6 +378,7 @@ class SessionNotifier extends StateNotifier<List<Session>> {
           .removeWhere((_, session) => identical(session, removed));
       _requestIdToSession
           .removeWhere((_, session) => identical(session, removed));
+      _evictSessionKeyMaterial(removed);
     }
     await _storage.deleteSession(sessionId);
     _emitState();
@@ -307,7 +387,10 @@ class SessionNotifier extends StateNotifier<List<Session>> {
   /// Delete session by requestId for timeout cleanup
   /// Used when create order timeout expires after 10s with no Mostro response
   Future<void> deleteSessionByRequestId(int requestId) async {
-    _requestIdToSession.remove(requestId);
+    final removed = _requestIdToSession.remove(requestId);
+    if (removed != null) {
+      _evictSessionKeyMaterial(removed);
+    }
     // Note: No storage deletion - these are temporary sessions in memory only
     _emitState();
   }
@@ -320,6 +403,7 @@ class SessionNotifier extends StateNotifier<List<Session>> {
       _pendingChildSessions
           .removeWhere((_, pending) => identical(pending, session));
       _sessions.removeWhere((_, stored) => identical(stored, session));
+      _evictSessionKeyMaterial(session);
       _emitState();
       logger.d('Cleaned up temporary session for requestId: $requestId');
     }
@@ -377,6 +461,7 @@ class SessionNotifier extends StateNotifier<List<Session>> {
 
     session.orderId = childOrderId;
     _sessions[childOrderId] = session;
+    _claimOrderId(childOrderId, session);
     await _storage.putSession(session);
     _emitState();
 

@@ -73,6 +73,20 @@ class AbstractMostroNotifier extends StateNotifier<OrderState> {
     }
   }
 
+  /// Emit only when the state actually changed.
+  ///
+  /// `OrderState` and its payloads compare by value, but `StateNotifier`'s
+  /// default check is identity: a replayed history message, a duplicated
+  /// gift wrap or a peer/dispute refresh that carries the same data would
+  /// still hand every watcher a "new" state and re-run the order book sort,
+  /// the dispute futures and every `MostroReactiveButton`. Comparing by
+  /// value here covers every assignment in this hierarchy — live events,
+  /// restore replays and order creation alike — instead of guarding call
+  /// sites one at a time.
+  @override
+  bool updateShouldNotify(OrderState old, OrderState current) =>
+      old != current;
+
   void subscribe() {
     subscription = ref.listen(
       mostroMessageStreamProvider(orderId),
@@ -93,6 +107,18 @@ class AbstractMostroNotifier extends StateNotifier<OrderState> {
               logger.i('Received message with action: ${msg?.action}');
             }
             if (msg != null) {
+              // Decided before anything treats this message as a response:
+              // updateWith would drop it, so it must not count as one. Notably
+              // it must not cancel the orphan-session timer below — a forged
+              // admin-* during a take would otherwise disarm the cleanup that
+              // exists for Mostro never answering, and strand the session.
+              if (state.rejectsAdminDisputeMessage(msg)) {
+                logger.w(
+                    'Dropping side effects for rejected ${msg.action} on order $orderId');
+                onAdminResolutionRejected(msg);
+                return;
+              }
+
               // Cancel timer on ANY response from Mostro for this order
               cancelSessionTimeoutCleanup(orderId);
 
@@ -110,6 +136,7 @@ class AbstractMostroNotifier extends StateNotifier<OrderState> {
               if (mounted) {
                 state = state.updateWith(msg);
               }
+
               if (msg.timestamp != null &&
                   msg.timestamp! >
                       DateTime.now()
@@ -164,6 +191,16 @@ class AbstractMostroNotifier extends StateNotifier<OrderState> {
           values: values ?? {}, orderId: orderId, eventId: eventId);
     }
   }
+
+  /// Called when an admin resolution was dropped for lack of dispute evidence.
+  ///
+  /// The rejection is decided from in-memory state, which during startup may
+  /// not yet hold the dispute this resolution belongs to. Subclasses that
+  /// hydrate from storage override this to replay the persisted history, where
+  /// the dispute and the resolution are applied in order. Replaying is safe:
+  /// the guard runs on every message of the replay, so a resolution with no
+  /// dispute ahead of it in the history is still rejected.
+  void onAdminResolutionRejected(MostroMessage message) {}
 
   Future<void> handleEvent(MostroMessage event,
       {bool bypassTimestampGate = false,
@@ -672,6 +709,16 @@ class AbstractMostroNotifier extends StateNotifier<OrderState> {
         }
         break;
 
+      // Mirrors adminSettled: an admin resolution is terminal but keeps its
+      // session, so the user retains the record of how the dispute ended.
+      // Deliberately not routed through the Action.canceled cleanup, which
+      // deletes the session and would erase that record.
+      case Action.adminCanceled:
+        if (isRecent && !bypassTimestampGate) {
+          navProvider.go('/trade_detail/$orderId');
+        }
+        break;
+
       case Action.cantDo:
         final cantDo = event.getPayload<CantDo>();
 
@@ -774,6 +821,11 @@ class AbstractMostroNotifier extends StateNotifier<OrderState> {
 
     logger.i('Started 10s timeout timer for requestId: $requestId');
   }
+
+  /// Whether the orphan-session cleanup is still armed for [orderId].
+  @visibleForTesting
+  static bool hasSessionTimeoutCleanup(String orderId) =>
+      _sessionTimeouts.containsKey(orderId);
 
   /// Cancels the timeout timer for a specific orderId
   static void cancelSessionTimeoutCleanup(String orderId) {

@@ -47,20 +47,61 @@ class SubscriptionManager {
   Stream<NostrEvent> get disputeChat => _disputeChatController.stream;
   Stream<RelayListEvent> get relayList => _relayListController.stream;
 
+  /// Session-derived subscription types. [SubscriptionType.relayList] is
+  /// driven by the configured Mostro instance rather than by sessions, so the
+  /// session-driven paths must leave it alone — tearing it down there stops
+  /// relay discovery for the rest of the app's life.
+  static Iterable<SubscriptionType> get _sessionSubscriptionTypes =>
+      SubscriptionType.values.where((t) => t != SubscriptionType.relayList);
+
+  /// Last Mostro pubkey asked for on the relay-list stream. [subscribeAll]
+  /// rebuilds every other subscription from sessions, but the relay list has
+  /// no session to rebuild it from, so it has to be remembered here.
+  String? _relayListPubkey;
+
+  /// True between [suspend] and [resume]: the app is backgrounded and the
+  /// background service owns the filters. Work scheduled before the switch
+  /// (a relay sync retry, say) must not re-open a REQ behind its back.
+  bool _isSuspended = false;
+
+  /// Identity of the filter each session subscription was built from
+  /// (sorted keys + transport + node). When a session-list emission produces
+  /// the same identity, the CLOSE + REQ (and its full history replay) is
+  /// skipped. Cleared in [unsubscribeByType] so an explicit teardown always
+  /// forces the next update through.
+  final Map<SubscriptionType, String> _appliedFilterKeys = {};
+
+  /// Per-type chain serializing subscription updates. The chat paths await a
+  /// cursor warm-up before recording their filter key, so without this two
+  /// identical bursty emissions both pass the identity check while the first
+  /// is still warming up, and each replays the CLOSE + REQ. Same pattern as
+  /// [ChatCursorStore.advance].
+  final Map<SubscriptionType, Future<void>> _updateQueue = {};
+
+  /// Debounce for relay-driven resubscribes: startup and network recovery
+  /// bring several relays alive in a burst; one re-issue covers them all.
+  static const relayResubscribeDebounce = Duration(seconds: 1);
+
+  StreamSubscription<int>? _relayGenerationListener;
+  Timer? _relayResubscribeTimer;
+
   SubscriptionManager(this.ref) {
     _initSessionListener();
     // Ensure resources are released with provider/container lifecycle
     ref.onDispose(dispose);
     _initializeExistingSessions();
     _initMostroInstanceListener();
+    _initRelayGenerationListener();
   }
 
   /// Watches the connected node's info event so the orders subscription can
   /// switch to the v2 (kind 14) transport once the node advertises
   /// `protocol_version=2`. The info event arrives asynchronously after the
   /// initial subscription, so without this the orders filter would stay pinned
-  /// to the transport resolved at subscription time (typically v1 at cold
-  /// start). Re-subscribes only when the resolved transport actually changes.
+  /// to the transport resolved at subscription time (v2 by default, see
+  /// [resolveTransport]) and would never fall back for a node that actually
+  /// advertises `protocol_version=1`. Re-subscribes only when the resolved
+  /// transport actually changes.
   void _initMostroInstanceListener() {
     try {
       _mostroInstanceListener =
@@ -85,15 +126,71 @@ class SubscriptionManager {
   }
 
   /// Resolves the transport for the orders subscription from the connected
-  /// node's advertised `protocol_version` (§2, §4.1). Defaults to v1 gift wrap
-  /// when the node info is not yet available or unreadable.
+  /// node's advertised `protocol_version` (§2, §4.1). Defaults to v2 NIP-44
+  /// when the node info is not yet available or unreadable, matching
+  /// [resolveTransport]: gift wrap is obsolete, so falling back to it would
+  /// pin the session to a kind-1059 REQ the node never answers.
   Transport _resolveOrdersTransport() {
     try {
       final infoEvent = ref.read(orderRepositoryProvider).mostroInstance;
       return resolveTransport(infoEvent?.protocolVersion);
     } catch (e) {
-      logger.w('Failed to resolve orders transport, defaulting to v1: $e');
-      return Transport.giftWrap;
+      logger.w('Failed to resolve orders transport, defaulting to v2: $e');
+      return Transport.nip44;
+    }
+  }
+
+  /// Re-issues every open REQ when a relay comes (back) alive. dart_nostr
+  /// sends a REQ once, to the sockets registered at that moment: a socket
+  /// that silently reconnects (mobile radio sleep, network change) or a relay
+  /// added afterwards by the kind 10002 sync carries no subscriptions until
+  /// something replays them. Before the filter-identity skip, the periodic
+  /// session-cleanup emission re-issued the REQs as a side effect; this
+  /// listener makes that guarantee explicit. The relay generation is part of
+  /// [_filterIdentity], so the forced update passes the skip check.
+  void _initRelayGenerationListener() {
+    try {
+      _relayGenerationListener =
+          ref.read(nostrServiceProvider).relayGenerationStream.listen(
+        (_) {
+          if (_isSuspended) return;
+          _relayResubscribeTimer?.cancel();
+          _relayResubscribeTimer =
+              Timer(relayResubscribeDebounce, _resubscribeForRelayGeneration);
+        },
+        onError: (Object error, StackTrace stackTrace) {
+          logger.e('Error in relay generation listener',
+              error: error, stackTrace: stackTrace);
+        },
+      );
+    } catch (e, stackTrace) {
+      logger.e('Failed to init relay generation listener',
+          error: e, stackTrace: stackTrace);
+    }
+  }
+
+  void _resubscribeForRelayGeneration() {
+    if (_isSuspended) return;
+    final sessions = ref.read(sessionNotifierProvider);
+    if (sessions.isNotEmpty) {
+      logger.i('Relay generation changed, re-issuing session subscriptions');
+      _updateAllSubscriptions(sessions);
+    }
+    // The relay-list REQ is not session-derived; replace it in place so the
+    // newly alive socket receives it too.
+    final mostroPubkey = _relayListPubkey;
+    if (mostroPubkey != null) {
+      subscribeToMostroRelayList(mostroPubkey);
+    }
+  }
+
+  /// Best-effort read of the relay generation for the filter identity. Falls
+  /// back to 0 so an unavailable NostrService never blocks a subscription.
+  int _relayGeneration() {
+    try {
+      return ref.read(nostrServiceProvider).relayGeneration;
+    } catch (_) {
+      return 0;
     }
   }
 
@@ -139,19 +236,34 @@ class SubscriptionManager {
       return;
     }
 
-    for (final type in SubscriptionType.values) {
+    for (final type in _sessionSubscriptionTypes) {
       unawaited(_updateSubscription(type, sessions));
     }
   }
 
   void _clearAllSubscriptions() {
-    for (final type in SubscriptionType.values) {
+    for (final type in _sessionSubscriptionTypes) {
       unsubscribeByType(type);
     }
   }
 
   Future<void> _updateSubscription(
+      SubscriptionType type, List<Session> sessions) {
+    final previous = _updateQueue[type] ?? Future.value();
+    final next = previous
+        .catchError((_) {})
+        .then((_) => _applySubscriptionUpdate(type, sessions));
+    _updateQueue[type] = next;
+    return next;
+  }
+
+  Future<void> _applySubscriptionUpdate(
       SubscriptionType type, List<Session> sessions) async {
+    // A queued update can run after [suspend]; the background service owns
+    // the filters then, and [resume] rebuilds everything from sessions.
+    if (_isSuspended) {
+      return;
+    }
     if (sessions.isEmpty) {
       logger.i('No sessions for $type subscription');
       unsubscribeByType(type);
@@ -159,6 +271,13 @@ class SubscriptionManager {
     }
 
     try {
+      final filterKey = _filterIdentity(type, sessions);
+      if (filterKey != null &&
+          _appliedFilterKeys[type] == filterKey &&
+          _subscriptions.containsKey(type)) {
+        return;
+      }
+
       // Pre-warm persisted cursors so the chat filters — built
       // synchronously and later persisted for the background service —
       // see durable state even on a cold start
@@ -176,6 +295,16 @@ class SubscriptionManager {
             .whereType<String>();
         await ref.read(chatCursorStoreProvider).warmUp(orderIds);
       }
+      if (type == SubscriptionType.orders) {
+        // Best-effort: a prefs/storage failure must not prevent the REQ.
+        try {
+          await ref
+              .read(ordersCursorStoreProvider)
+              .warmUp([ref.read(settingsProvider).mostroPublicKey]);
+        } catch (e) {
+          logger.w('Orders cursor warm-up unavailable: $e');
+        }
+      }
 
       final filter = _createFilterForType(type, sessions);
       if (filter == null) {
@@ -187,6 +316,9 @@ class SubscriptionManager {
         type: type,
         filter: filter,
       );
+      if (filterKey != null) {
+        _appliedFilterKeys[type] = filterKey;
+      }
 
       logger
           .i('Subscription created for $type with ${sessions.length} sessions');
@@ -194,6 +326,55 @@ class SubscriptionManager {
       logger.e('Failed to create $type subscription',
           error: e, stackTrace: stackTrace);
     }
+  }
+
+  /// Stable identity of the inputs a session filter is derived from. Uses
+  /// the shared-key publics directly (not the derived K_sign) so no EC math
+  /// runs on the skip path. Cursor `since` values are deliberately excluded:
+  /// while a subscription stays open its cursor only moves forward. The relay
+  /// generation is included because "filter unchanged" does not imply "REQ
+  /// still delivered": a reconnected or newly added relay has no
+  /// subscriptions until the REQ is re-issued to it.
+  String? _filterIdentity(SubscriptionType type, List<Session> sessions) {
+    final generation = _relayGeneration();
+    switch (type) {
+      case SubscriptionType.orders:
+        final keys = sessions.map((s) => s.tradeKey.public).toList()..sort();
+        final transport = _resolveOrdersTransport();
+        final node = ref.read(settingsProvider).mostroPublicKey;
+        return 'orders|g$generation|$transport|$node|${keys.join(',')}';
+      case SubscriptionType.chat:
+        final keys = sessions
+            .where((s) => s.sharedKey != null)
+            .map((s) => s.sharedKey!.public)
+            .toList()
+          ..sort();
+        return keys.isEmpty ? null : 'chat|g$generation|${keys.join(',')}';
+      case SubscriptionType.disputeChat:
+        final keys = sessions
+            .where((s) => s.adminSharedKey != null)
+            .map((s) => s.adminSharedKey!.public)
+            .toList()
+          ..sort();
+        return keys.isEmpty ? null : 'dispute|g$generation|${keys.join(',')}';
+      case SubscriptionType.relayList:
+        return null;
+    }
+  }
+
+  /// Earliest start time across [sessions], or the default lookback when that
+  /// is older — whichever reaches further back. A session older than the
+  /// lookback widens the window to cover it, and a newer one cannot narrow it
+  /// below the lookback. Used as the bootstrap `since` when no cursor is
+  /// stored yet.
+  DateTime _sessionsFloor(List<Session> sessions) {
+    final defaultFloor =
+        DateTime.now().subtract(NostrEventExtensions.chatDefaultLookback);
+    if (sessions.isEmpty) return defaultFloor;
+    final oldest = sessions
+        .map((s) => s.startTime)
+        .reduce((a, b) => a.isBefore(b) ? a : b);
+    return oldest.isBefore(defaultFloor) ? oldest : defaultFloor;
   }
 
   NostrFilter? _createFilterForType(
@@ -209,10 +390,30 @@ class SubscriptionManager {
         // and re-subscribe when the node info arrives after this subscription.
         final transport = _resolveOrdersTransport();
         _appliedOrdersTransport = transport;
+        final mostroPubkey = ref.read(settingsProvider).mostroPublicKey;
+        // Persisted cursor bounds the replay; fresh installs fall back to the
+        // default lookback (older history is served by the restore flow).
+        DateTime? cursorSince;
+        try {
+          cursorSince =
+              ref.read(ordersCursorStoreProvider).cachedSinceFor(mostroPubkey);
+        } catch (e) {
+          logger.w('Orders cursor unavailable, using default lookback: $e');
+        }
+        // No cursor yet means a fresh install *or* the first launch after
+        // upgrading to the cursor build. An upgrading install can hold orders
+        // far older than the default lookback (non-terminal orders are kept
+        // well past 30 days) and normal startup does not run the restore
+        // flow, so the window must also reach back to the oldest live
+        // session: no message of an active order predates its session.
+        final ordersSince = cursorSince ??
+            _sessionsFloor(sessions)
+                .subtract(ChatCursorStore.cursorOverlap);
         return buildOrdersFilter(
           transport,
           tradeKeys,
-          ref.read(settingsProvider).mostroPublicKey,
+          mostroPubkey,
+          since: ordersSince,
         );
       case SubscriptionType.chat:
         // Kind 14 chat envelope: filter by the K_sign authors derived from
@@ -351,6 +552,7 @@ class SubscriptionManager {
   }
 
   void unsubscribeByType(SubscriptionType type) {
+    _appliedFilterKeys.remove(type);
     final subscription = _subscriptions[type];
     if (subscription != null) {
       subscription.cancel();
@@ -375,6 +577,36 @@ class SubscriptionManager {
     unsubscribeAll();
     final currentSessions = ref.read(sessionNotifierProvider);
     _updateAllSubscriptions(currentSessions);
+    _restoreRelayListSubscription();
+  }
+
+  /// Brings the app's subscriptions down for backgrounding. Separate from
+  /// [unsubscribeAll] so that pending callbacks cannot re-open a REQ while the
+  /// background service owns the filters.
+  void suspend() {
+    _isSuspended = true;
+    // A pending relay-driven resubscribe must not fire while the background
+    // service owns the filters; resume() rebuilds everything anyway.
+    _relayResubscribeTimer?.cancel();
+    _relayResubscribeTimer = null;
+    unsubscribeAll();
+  }
+
+  /// Brings the app's subscriptions back up on foreground, relay list included.
+  void resume() {
+    _isSuspended = false;
+    subscribeAll();
+  }
+
+  /// Re-opens the relay-list subscription after a teardown that cannot rebuild
+  /// it from sessions. No-op when nothing ever asked for one, while suspended,
+  /// or when one is already open.
+  void _restoreRelayListSubscription() {
+    final mostroPubkey = _relayListPubkey;
+    if (mostroPubkey == null || _isSuspended) return;
+    if (_subscriptions.containsKey(SubscriptionType.relayList)) return;
+    logger.i('Restoring relay list subscription for Mostro: $mostroPubkey');
+    subscribeToMostroRelayList(mostroPubkey);
   }
 
   void unsubscribeAll() {
@@ -386,6 +618,14 @@ class SubscriptionManager {
   /// Subscribes to kind 10002 relay list events from a specific Mostro instance.
   /// This is used to automatically sync relays with the configured Mostro instance.
   void subscribeToMostroRelayList(String mostroPubkey) {
+    // Remembered even while suspended, so [resume] can re-open it.
+    _relayListPubkey = mostroPubkey;
+    if (_isSuspended) {
+      logger.i(
+          'App is backgrounded; deferring relay list subscription for Mostro: $mostroPubkey');
+      return;
+    }
+
     try {
       final filter = NostrFilter(
         kinds: [10002],
@@ -444,6 +684,7 @@ class SubscriptionManager {
 
   /// Unsubscribes from Mostro relay list events
   void unsubscribeFromMostroRelayList() {
+    _relayListPubkey = null;
     unsubscribeByType(SubscriptionType.relayList);
     logger.i('Unsubscribed from Mostro relay list');
   }
@@ -451,6 +692,8 @@ class SubscriptionManager {
   void dispose() {
     _sessionListener.close();
     _mostroInstanceListener?.cancel();
+    _relayGenerationListener?.cancel();
+    _relayResubscribeTimer?.cancel();
     unsubscribeAll();
     _ordersController.close();
     _chatController.close();
@@ -472,19 +715,34 @@ class SubscriptionManager {
 NostrFilter buildOrdersFilter(
   Transport transport,
   List<String> tradeKeys,
-  String mostroPubkey,
-) {
+  String mostroPubkey, {
+  DateTime? since,
+}) {
   switch (transport) {
     case Transport.giftWrap:
+      // Legacy transport: gift wrap timestamps are randomized ±48 h, so a
+      // cursor since would silently drop messages. Left unbounded until the
+      // 1059 branch is removed.
       return NostrFilter(
         kinds: [1059],
         p: tradeKeys,
       );
     case Transport.nip44:
+      // kind 14 carries real timestamps, so the persisted cursor (minus its
+      // overlap) bounds the replay. Deliberately no limit on top of it: the
+      // relay answers a capped filter with the *newest* n and silently drops
+      // the rest of the window, and events that are never delivered never
+      // enter _retryableEvents, so nothing holds the cursor back — it
+      // advances past them and they are lost for good. That window is widest
+      // exactly when it matters (the first launch after upgrading, or a user
+      // offline for a long stretch). The filter is already scoped to one
+      // node's messages addressed to this user's trade keys, so `since`
+      // alone keeps it small.
       return NostrFilter(
         kinds: [14],
         authors: [mostroPubkey],
         p: tradeKeys,
+        since: since,
       );
   }
 }

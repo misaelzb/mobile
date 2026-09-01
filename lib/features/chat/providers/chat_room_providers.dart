@@ -1,4 +1,5 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:mostro_mobile/services/chat_read_status_service.dart';
 import 'package:mostro_mobile/services/logger_service.dart';
 import 'package:mostro_mobile/data/models/chat_room.dart';
 import 'package:mostro_mobile/features/chat/notifiers/chat_rooms_notifier.dart';
@@ -34,43 +35,56 @@ final sortedChatRoomsProvider = Provider<List<ChatRoom>>((ref) {
     return ref.watch(chatRoomsProvider(chatRoom.orderId));
   }).toList();
   
-  // Sort by session start time (most recently taken order first)
-  chatRoomsWithFreshData.sort((a, b) {
-    final aSessionStartTime = _getSessionStartTime(ref, a);
-    final bSessionStartTime = _getSessionStartTime(ref, b);
-    return bSessionStartTime.compareTo(aSessionStartTime);
-  });
-  
+  // Sort by session start time (most recently taken order first). Keys are
+  // computed once per room: the comparator used to call ref.read and log on
+  // every comparison (O(n log n) per rebuild), and its per-comparison
+  // DateTime.now() fallback made the ordering unstable.
+  final fallbackTime = DateTime.now().millisecondsSinceEpoch ~/ 1000;
+  final startTimes = <String, int>{
+    for (final room in chatRoomsWithFreshData)
+      room.orderId: _getSessionStartTime(ref, room, fallbackTime),
+  };
+  chatRoomsWithFreshData.sort(
+    (a, b) => startTimes[b.orderId]!.compareTo(startTimes[a.orderId]!),
+  );
+
   return chatRoomsWithFreshData;
 });
 
 // Logger instance for session start time operations
 
 
-// Helper function to get session start time for sorting with improved error handling
-int _getSessionStartTime(Ref ref, ChatRoom chatRoom) {
+// Session start time for sorting; [fallbackTime] keeps rooms without a
+// session at the top with a stable key.
+int _getSessionStartTime(Ref ref, ChatRoom chatRoom, int fallbackTime) {
   try {
-    // Safely attempt to read the session with proper error handling
     final session = ref.read(sessionProvider(chatRoom.orderId));
     if (session != null) {
-      // Return the session start time (when the order was taken/contacted)
-      final startTime = session.startTime.millisecondsSinceEpoch ~/ 1000;
-      logger.d('Retrieved session start time for chat ${chatRoom.orderId}: $startTime');
-      return startTime;
-    } else {
-      logger.i('No session found for chat ${chatRoom.orderId}, using fallback time');
+      return session.startTime.millisecondsSinceEpoch ~/ 1000;
     }
   } catch (e, stackTrace) {
-    // Enhanced error handling with proper logging for diagnostics
     logger.e(
       'Error getting session start time for chat ${chatRoom.orderId}: $e',
       error: e,
       stackTrace: stackTrace,
     );
   }
-  
-  // Fallback: use current time so new chats appear at top
-  final fallbackTime = DateTime.now().millisecondsSinceEpoch ~/ 1000;
-  logger.d('Using fallback time for chat ${chatRoom.orderId}: $fallbackTime');
   return fallbackTime;
 }
+
+/// Whether the chat for [orderId] has peer messages newer than the read
+/// cursor. Replaces a per-row FutureBuilder whose future (a prefs read) was
+/// recreated on every rebuild; this recomputes only when the room changes.
+/// Invalidate it after `ChatReadStatusService.markChatAsRead`.
+final chatHasUnreadProvider =
+    FutureProvider.family<bool, String>((ref, orderId) async {
+  final session = ref.watch(sessionProvider(orderId));
+  if (session == null) return false;
+  final room = ref.watch(chatRoomsProvider(orderId));
+  if (room.messages.isEmpty) return false;
+  return ChatReadStatusService.hasUnreadMessages(
+    orderId,
+    room.messages,
+    session.tradeKey.public,
+  );
+});

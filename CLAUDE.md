@@ -50,7 +50,10 @@ When implementing or debugging protocol-related features (order flows, actions, 
 ### Nostr Integration
 - **NostrService** (`services/nostr_service.dart`) manages relay connections and messaging
 - All Nostr protocol interactions go through this service
-- **MostroFSM** (`core/mostro_fsm.dart`) manages order state transitions
+- **MostroFSM** (`core/mostro_fsm.dart`) defines a transition matrix but is **not wired in** — nothing imports it
+  - Order status is actually derived by `OrderState._getStatusFromAction` (`features/order/models/order_state.dart`), which maps actions to statuses without consulting the matrix
+  - Do not read `mostro_fsm.dart` as an active validation layer. Its role axis models who performs an action, not the local user's role in the trade (the app never assigns `Role.admin` to a session), so wiring it as-is would reject legitimate admin resolutions
+  - The only transition guard that runs today is the dispute-evidence check on `admin-*` actions in `OrderState.updateWith`
 
 ### Navigation and UI
 - **GoRouter** for navigation (configured in `core/app_routes.dart`)
@@ -131,6 +134,8 @@ The app follows a specific initialization order in `appInitializerProvider`:
 - SessionNotifier must complete initialization before SubscriptionManager setup
 - SubscriptionManager uses `fireImmediately: false` to prevent premature execution
 - Proper sequence ensures orders appear consistently in UI across app restarts
+- There is exactly **one** `SubscriptionManager`, owned by `subscriptionManagerProvider`. `RelaysNotifier` borrows it (`ref.read`) for the kind 10002 relay-list stream and must never construct its own instance nor dispose the shared one — a private copy re-issues every orders/chat/dispute REQ on every relay (regression test: `test/features/relays/relays_notifier_subscription_manager_test.dart`). Because `RelaysNotifier` is read during bootstrap, the shared manager may be created before `SessionNotifier.init()`; that is safe since `init()` always emits state, which the manager's session listener turns into the initial subscriptions
+- `SubscriptionType.relayList` is the one subscription `SubscriptionManager` cannot rebuild from sessions (`_createFilterForType` returns null for it), so it is tracked separately: `subscribeToMostroRelayList()` remembers the pubkey and `subscribeAll()` restores the REQ. Backgrounding goes through `suspend()`/`resume()` rather than `unsubscribeAll()`/`subscribeAll()`, so a late relay-sync retry cannot re-open a REQ while the background service owns connectivity (regression test: `test/features/subscriptions/subscription_manager_relay_list_lifecycle_test.dart`)
 
 ## Timeout Detection & Orphan Session Prevention
 

@@ -12,6 +12,12 @@ const orderEventKind = 38383;
 const infoEventKind = 38385;
 const orderFilterDurationHours = 48;
 
+/// How long a send path waits for the node's kind-38385 info event before
+/// falling back to defaults. The info event normally arrives with the initial
+/// order subscription; this only bounds a cold start against a slow relay and
+/// stays well under the 10s orphan-session cleanup timer.
+const mostroInstanceWaitTimeout = Duration(seconds: 3);
+
 class OpenOrdersRepository implements OrderRepository<NostrEvent> {
   final NostrService _nostrService;
   NostrEvent? _mostroInstance;
@@ -33,6 +39,11 @@ class OpenOrdersRepository implements OrderRepository<NostrEvent> {
   /// init() completes, so the order subscription can be opened once Nostr is up.
   Timer? _initRetryTimer;
 
+  /// Coalesces stream emissions: during a 48 h replay burst every relay copy
+  /// used to trigger a full-list emission (and downstream sort/filter).
+  static const Duration emitDebounce = Duration(milliseconds: 50);
+  Timer? _emitTimer;
+
   static const _initRetryInterval = Duration(milliseconds: 200);
   static const _maxInitRetries = 150; // ~30s before giving up
 
@@ -40,6 +51,36 @@ class OpenOrdersRepository implements OrderRepository<NostrEvent> {
 
   Stream<NostrEvent> get mostroInstanceStream =>
       _mostroInstanceController.stream;
+
+  /// Returns the node's kind-38385 info event, waiting up to [timeout] for it
+  /// if it has not arrived yet.
+  ///
+  /// The info event carries both the PoW difficulty and the `protocol_version`
+  /// that selects the outbound transport, so a send issued before it lands
+  /// would have to guess both. Guessing the transport wrong is unrecoverable:
+  /// the node ignores the envelope it does not speak and nothing retries the
+  /// action. Send paths await this instead; a timeout still falls back to the
+  /// caller's defaults (PoW 0, [resolveTransport]'s v2 default) so an
+  /// unreachable node degrades rather than blocks the UI.
+  Future<NostrEvent?> awaitMostroInstance({
+    Duration timeout = mostroInstanceWaitTimeout,
+  }) async {
+    final cached = _mostroInstance;
+    if (cached != null) return cached;
+    if (_mostroInstanceController.isClosed) return null;
+    try {
+      return await _mostroInstanceController.stream.first.timeout(timeout);
+    } on TimeoutException {
+      logger.w(
+        'Mostro instance info did not arrive within '
+        '${timeout.inSeconds}s; proceeding with defaults',
+      );
+      return null;
+    } catch (e) {
+      logger.w('Failed while waiting for Mostro instance info: $e');
+      return null;
+    }
+  }
 
   OpenOrdersRepository(this._nostrService, this._settings) {
     // Subscribe to orders and initialize data
@@ -78,10 +119,23 @@ class OpenOrdersRepository implements OrderRepository<NostrEvent> {
 
     _subscription = _nostrService.subscribeToEvents(request).listen((event) {
       if (event.type == 'order') {
-        _events[event.orderId!] = event;
-        _eventStreamController.add(_events.values.toList());
+        final orderId = event.orderId!;
+        // Drop duplicate/stale relay copies: kind 38383 is addressable, only
+        // the surviving replacement per order id matters.
+        final known = _events[orderId];
+        if (known != null && !_supersedes(event, known)) {
+          return;
+        }
+        _events[orderId] = event;
+        _scheduleEmit();
       } else if (event.kind == infoEventKind &&
           event.pubkey == _settings.mostroPublicKey) {
+        // Kind 38385 is addressable too, and it carries pow, protocolVersion
+        // and the order limits: a stale relay copy must not roll those back.
+        final knownInstance = _mostroInstance;
+        if (knownInstance != null && !_supersedes(event, knownInstance)) {
+          return;
+        }
         logger.i('Mostro instance info loaded: $event');
         _mostroInstance = event;
         if (!_mostroInstanceController.isClosed) {
@@ -118,16 +172,44 @@ class OpenOrdersRepository implements OrderRepository<NostrEvent> {
     });
   }
 
+  /// NIP-01 retention rule for addressable events: the newest `created_at`
+  /// wins and, when two copies share the same second, the lexicographically
+  /// lower event id does. Relays apply the same rule, so the copy kept here is
+  /// the one that actually survives on the relay set rather than whichever
+  /// relay happened to answer first.
+  static bool _supersedes(NostrEvent candidate, NostrEvent known) {
+    final knownAt = known.createdAt;
+    if (knownAt == null) return true;
+    final candidateAt = candidate.createdAt;
+    if (candidateAt == null) return false;
+    // compareTo compares the instant only, so a UTC and a local copy of the
+    // same second still tie instead of ordering arbitrarily.
+    final byTime = candidateAt.compareTo(knownAt);
+    if (byTime != 0) return byTime > 0;
+    final candidateId = candidate.id;
+    final knownId = known.id;
+    if (candidateId == null || knownId == null) return false;
+    return candidateId.compareTo(knownId) < 0;
+  }
+
   void _emitEvents() {
+    _emitTimer?.cancel();
+    _emitTimer = null;
     if (!_eventStreamController.isClosed) {
       _eventStreamController.add(_events.values.toList());
     }
+  }
+
+  /// Emits once per [emitDebounce] window instead of once per event.
+  void _scheduleEmit() {
+    _emitTimer ??= Timer(emitDebounce, _emitEvents);
   }
 
   @override
   void dispose() {
     _subscription?.cancel();
     _initRetryTimer?.cancel();
+    _emitTimer?.cancel();
     _eventStreamController.close();
     _mostroInstanceController.close();
     _events.clear();

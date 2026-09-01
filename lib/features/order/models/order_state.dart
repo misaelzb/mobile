@@ -109,12 +109,93 @@ class OrderState {
     );
   }
 
+  /// Dispute statuses in which the dispute is over: a resolution has already
+  /// been applied and no further admin action is expected for it.
+  static const _terminalDisputeStatuses = {
+    'resolved',
+    'seller-refunded',
+    'closed',
+  };
+
+  static bool _isAdminDisputeAction(Action action) =>
+      action == Action.adminSettled ||
+      action == Action.adminSettle ||
+      action == Action.adminCanceled ||
+      action == Action.adminCancel ||
+      action == Action.adminTookDispute ||
+      action == Action.adminTakeDispute;
+
+  /// Whether local state corroborates that a dispute exists for this order.
+  ///
+  /// Evidence is the tracked [Dispute] object and nothing else. In particular
+  /// [Status.dispute] does not qualify: any action mapping to that status sets
+  /// it without carrying a dispute, so accepting it would let a bare
+  /// `dispute` message stand in as the evidence for the `admin-*` message
+  /// right behind it.
+  ///
+  /// The incoming payload does not count either — taking an attacker-supplied
+  /// Dispute as its own justification is the vector this guards against. An
+  /// already-resolved dispute is not re-resolved, which blocks replaying an
+  /// authentic resolution onto a later state.
+  bool get _acceptsAdminDisputeAction {
+    final localDispute = dispute;
+    if (localDispute == null) return false;
+
+    final localDisputeStatus = localDispute.status?.toLowerCase();
+    return localDisputeStatus == null ||
+        !_terminalDisputeStatuses.contains(localDisputeStatus);
+  }
+
+  /// Whether [message] carries a Dispute for some dispute other than the one
+  /// this order tracks.
+  ///
+  /// Mostro sends `admin-settled` / `admin-canceled` confirmations with a null
+  /// payload, so a resolution naming a different dispute is not a shape the
+  /// daemon produces. Applying it would resolve the dispute this order does
+  /// track on the authority of a message about another one.
+  bool _hasMismatchedDisputePayload(MostroMessage message) {
+    final localDispute = dispute;
+    if (localDispute == null) return false;
+
+    final payloadDispute = message.getPayload<Dispute>();
+    return payloadDispute != null &&
+        payloadDispute.disputeId != localDispute.disputeId;
+  }
+
+  /// Whether [updateWith] would drop this message for lack of dispute evidence
+  /// or because it names a dispute this order does not track.
+  ///
+  /// Callers use this to suppress the message's side effects too. A rejected
+  /// resolution that still raises a notification or navigates would hand the
+  /// attacker the user-visible half of the forgery. Takes the whole message
+  /// rather than the action alone so that no caller can consult the guard
+  /// without also seeing the payload it depends on.
+  bool rejectsAdminDisputeMessage(MostroMessage message) =>
+      _isAdminDisputeAction(message.action) &&
+      (!_acceptsAdminDisputeAction || _hasMismatchedDisputePayload(message));
+
   OrderState updateWith(MostroMessage message) {
-    logger.i('Updating OrderState with Action: ${message.action}');
+    logger.d('Updating OrderState with Action: ${message.action}');
 
     // Preserve the current state entirely for cantDo messages - they are informational only
     if (message.action == Action.cantDo) {
       return copyWith(cantDo: message.getPayload<CantDo>());
+    }
+
+    // An admin resolution only means something as the outcome of a dispute that
+    // already exists. Applied unconditionally, a forged or replayed admin-*
+    // message flips a live trade to a terminal state and drives the resolution
+    // UI, so drop it unless local state corroborates the dispute. Checked
+    // before the reputation notice below so a forged resolution cannot write
+    // even a reputation snapshot.
+    if (rejectsAdminDisputeMessage(message)) {
+      logger.w(
+        'Ignoring ${message.action} for order ${message.id}: no dispute '
+        'evidence in local state (status: $status, dispute: ${dispute?.status ?? 'none'}, '
+        'payload dispute: ${message.getPayload<Dispute>()?.disputeId ?? 'none'}, '
+        'tracked dispute: ${dispute?.disputeId ?? 'none'})',
+      );
+      return this;
     }
 
     // The taker-reputation notice is informational too: it reuses a flow
@@ -136,12 +217,12 @@ class OrderState {
       effectiveAction = newFiatWasSent
           ? Action.cooperativeCancelFiatSentByYou
           : Action.cooperativeCancelNoFiatByYou;
-      logger.i('Remapped ${message.action} → $effectiveAction (fiatWasSent: $newFiatWasSent)');
+      logger.d('Remapped ${message.action} → $effectiveAction (fiatWasSent: $newFiatWasSent)');
     } else if (message.action == Action.cooperativeCancelInitiatedByPeer) {
       effectiveAction = newFiatWasSent
           ? Action.cooperativeCancelFiatSentByPeer
           : Action.cooperativeCancelNoFiatByPeer;
-      logger.i('Remapped ${message.action} → $effectiveAction (fiatWasSent: $newFiatWasSent)');
+      logger.d('Remapped ${message.action} → $effectiveAction (fiatWasSent: $newFiatWasSent)');
     }
 
     // Determine the new status based on the action received
@@ -149,21 +230,21 @@ class OrderState {
         effectiveAction, message.getPayload<Order>()?.status);
 
     // DEBUG: Log status mapping
-    logger.i('Status mapping: $effectiveAction → $newStatus');
+    logger.d('Status mapping: $effectiveAction → $newStatus');
 
     // A pending order has no counterpart: when Mostro republishes it after the
     // taker times out, the previous taker's snapshot must not be carried into
     // the next take and shown as if it belonged to whoever takes it next.
     final bool orderReactivated = newStatus == Status.pending;
     if (orderReactivated && peerReputation != null) {
-      logger.i('Order returned to pending: dropping the taker reputation');
+      logger.d('Order returned to pending: dropping the taker reputation');
     }
 
     // Preserve PaymentRequest correctly
     PaymentRequest? newPaymentRequest;
     if (message.payload is PaymentRequest) {
       newPaymentRequest = message.getPayload<PaymentRequest>();
-      logger.i('New PaymentRequest found in message');
+      logger.d('New PaymentRequest found in message');
     } else {
       newPaymentRequest = paymentRequest; // Preserve existing
     }
@@ -172,7 +253,7 @@ class OrderState {
     if (message.payload is Peer &&
         message.getPayload<Peer>()!.publicKey.isNotEmpty) {
       newPeer = message.getPayload<Peer>();
-      logger.i('👤 New Peer found in message');
+      logger.d('👤 New Peer found in message');
     } else if (message.payload is Order) {
       if (message.getPayload<Order>()!.buyerTradePubkey != null) {
         newPeer =
@@ -181,17 +262,33 @@ class OrderState {
         newPeer =
             Peer(publicKey: message.getPayload<Order>()!.sellerTradePubkey!);
       }
-      logger.i('👤 New Peer found in message');
+      logger.d('👤 New Peer found in message');
     } else {
       newPeer = peer; // Preserve existing
     }
 
-    // Handle dispute status updates based on action
-    Dispute? updatedDispute = message.getPayload<Dispute>() ?? dispute;
-    
+    // Handle dispute status updates based on action.
+    // A payload dispute never re-points a tracked dispute at a different id:
+    // only the dispute this order already carries can be updated from the wire.
+    final localDispute = dispute;
+    final payloadDispute = message.getPayload<Dispute>();
+    final bool payloadDisputeAccepted = payloadDispute != null &&
+        (localDispute == null ||
+            payloadDispute.disputeId == localDispute.disputeId);
+
+    if (payloadDispute != null && !payloadDisputeAccepted) {
+      logger.w(
+        'Ignoring dispute payload ${payloadDispute.disputeId} for order '
+        '${message.id}: does not match tracked dispute ${localDispute!.disputeId}',
+      );
+    }
+
+    Dispute? updatedDispute =
+        payloadDisputeAccepted ? payloadDispute : localDispute;
+
     // If we got a dispute from the message payload, ensure it has the message timestamp
     // This is critical for correct sorting in the dispute list
-    if (updatedDispute != null && message.getPayload<Dispute>() != null) {
+    if (updatedDispute != null && payloadDisputeAccepted) {
       // Use message timestamp if dispute doesn't have a createdAt or if message has a timestamp
       // Note: Nostr timestamps are in seconds, so convert to milliseconds
       if (message.timestamp != null) {
@@ -201,7 +298,7 @@ class OrderState {
           updatedDispute = updatedDispute.copyWith(
             createdAt: DateTime.fromMillisecondsSinceEpoch(tsMs),
           );
-          logger.i('Updated dispute ${updatedDispute.disputeId} createdAt from message timestamp: ${updatedDispute.createdAt}');
+          logger.d('Updated dispute ${updatedDispute.disputeId} createdAt from message timestamp: ${updatedDispute.createdAt}');
         }
       }
     }
@@ -221,7 +318,7 @@ class OrderState {
         final peerPayload = message.getPayload<Peer>();
         if (peerPayload != null && peerPayload.publicKey.isNotEmpty) {
           adminPubkey = peerPayload.publicKey;
-          logger.i('Extracted admin pubkey from Peer payload: $adminPubkey');
+          logger.d('Extracted admin pubkey from Peer payload: $adminPubkey');
         }
       }
       
@@ -230,22 +327,22 @@ class OrderState {
         adminTookAt: DateTime.now(),
         adminPubkey: adminPubkey,
       );
-      logger.i('Updated dispute status to in-progress for adminTookDispute action');
+      logger.d('Updated dispute status to in-progress for adminTookDispute action');
     } else if (message.action == Action.adminSettled && updatedDispute != null) {
       // When admin settles dispute, update status to resolved with settlement info
       updatedDispute = updatedDispute.copyWith(
         status: 'resolved',
         action: 'admin-settled', // Store the resolution type
       );
-      logger.i('Updated dispute status to resolved for adminSettled action');
+      logger.d('Updated dispute status to resolved for adminSettled action');
     } else if (message.action == Action.adminCanceled && updatedDispute != null) {
       // When admin cancels order, update dispute status to seller-refunded
       updatedDispute = updatedDispute.copyWith(
         status: 'seller-refunded',
         action: 'admin-canceled', // Store the resolution type
       );
-      logger.i('Updated dispute status to seller-refunded for adminCanceled action');
-      logger.i('Dispute status updated to: ${updatedDispute.status}');
+      logger.d('Updated dispute status to seller-refunded for adminCanceled action');
+      logger.d('Dispute status updated to: ${updatedDispute.status}');
     }
 
     // Auto-close dispute when order reaches terminal state by user action
@@ -259,7 +356,7 @@ class OrderState {
         status: 'closed',
         action: 'user-completed',
       );
-      logger.i('Auto-closed dispute: order completed by users');
+      logger.d('Auto-closed dispute: order completed by users');
     } else if (updatedDispute != null &&
         !disputeAlreadyTerminal &&
         newStatus == Status.canceled &&
@@ -268,7 +365,7 @@ class OrderState {
         status: 'closed',
         action: 'cooperative-cancel',
       );
-      logger.i('Auto-closed dispute: cooperative cancellation');
+      logger.d('Auto-closed dispute: cooperative cancellation');
     }
 
     // Bond acks (3.5) and slash notice (4): their SmallOrder has a null status
@@ -298,7 +395,7 @@ class OrderState {
       clearPeerReputation: orderReactivated,
     );
 
-    logger.i('New state: ${newState.status} - ${newState.action}');
+    logger.d('New state: ${newState.status} - ${newState.action}');
     logger
         .i('PaymentRequest preserved: ${newState.paymentRequest != null}');
 
@@ -367,11 +464,16 @@ class OrderState {
       // Actions that should set status to canceled
       case Action.canceled:
       case Action.cancel:
-      case Action.adminCanceled:
-      case Action.adminCancel:
       case Action.cooperativeCancelAccepted:
       case Action.holdInvoicePaymentCanceled:
         return Status.canceled;
+
+      // A dispute resolved by cancelation is its own terminal state: it keeps
+      // the admin resolution visible to the user and out of the plain-cancel
+      // cleanup paths, which are built around Action.canceled.
+      case Action.adminCanceled:
+      case Action.adminCancel:
+        return Status.canceledByAdmin;
 
       // Actions that should set status to cooperatively canceled (pending cancellation)
       case Action.cooperativeCancelInitiatedByYou:

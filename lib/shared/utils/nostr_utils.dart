@@ -1,3 +1,4 @@
+import 'dart:isolate';
 import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'dart:convert';
@@ -67,8 +68,39 @@ class NostrUtils {
     return _instance.services.keys.derivePublicKey(privateKey: privateKey);
   }
 
+  /// Deep validation (constructs an EC key pair, one scalar multiplication).
+  /// Use only at real input boundaries (auth/key import); hot paths guard
+  /// session-derived keys with the cheaper [isCanonicalPrivateKey] instead.
   static bool isValidPrivateKey(String privateKey) {
     return _instance.services.keys.isValidPrivateKey(privateKey);
+  }
+
+  static final RegExp _hexKey = RegExp(r'^[0-9a-fA-F]{64}$');
+
+  /// Order of the secp256k1 group. A private key is the scalar `d` with
+  /// `0 < d < n`; outside that range there is no key.
+  static final BigInt _secp256k1Order = BigInt.parse(
+    'fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141',
+    radix: 16,
+  );
+
+  /// Cheap guard for keys the app derived itself: checks the hex encoding
+  /// *and* that the scalar is in range, without deriving a public key.
+  ///
+  /// The encoding alone is not enough. `bip340.getPublicKey` performs no range
+  /// check, so an out-of-range scalar reaches the curve arithmetic and fails
+  /// there — an all-zero key surfaces as `_TypeError: Null check operator used
+  /// on a null value` from the point at infinity, instead of the
+  /// `ArgumentError` these entry points promise.
+  ///
+  /// The range test is also stricter than [isValidPrivateKey], which only
+  /// rejects scalars congruent to zero (it accepts `n + 1` and above, since
+  /// `G * d` still yields a valid point), and it costs ~4 us against the
+  /// ~5.8 ms of the scalar multiplication that guard performs per call.
+  static bool isCanonicalPrivateKey(String privateKey) {
+    if (!_hexKey.hasMatch(privateKey)) return false;
+    final scalar = BigInt.parse(privateKey, radix: 16);
+    return scalar > BigInt.zero && scalar < _secp256k1Order;
   }
 
   // Signing and verification
@@ -273,10 +305,12 @@ class NostrUtils {
       createdAt: randomNow(),
     );
 
+    // The wrapper key is single-use; never retain its conversation key.
     return await encryptNIP44(
       jsonEncode(sealEvent.toMap()),
       wrapperKey,
       recipientPubKey,
+      cacheConversationKey: false,
     );
   }
 
@@ -310,6 +344,56 @@ class NostrUtils {
 
     return wrapEvent;
   }
+
+  /// Conversation keys are constant per (our key, their key) pair, but every
+  /// encrypt/decrypt recomputed them: one EC scalar multiplication plus HKDF
+  /// per message. Bounded cache; entries are evicted when their session is
+  /// cleaned up ([evictConversationKeysFor]), the whole map is dropped on
+  /// account wipe (`SessionNotifier.reset()` calls
+  /// [clearConversationKeyCache] — the map is static, so no provider
+  /// invalidation reaches it), and one-shot NIP-59 wrapper conversations are
+  /// never stored (`cache: false`).
+  static const int _conversationKeyCacheLimit = 512;
+  static final Map<String, Uint8List> _conversationKeys = {};
+
+  /// Returns a defensive copy on cache hits and stores its own copy on
+  /// misses: a caller mutating the returned bytes must never corrupt the
+  /// cached key process-wide.
+  static Uint8List conversationKeyFor(
+    String privateKey,
+    String publicKey, {
+    bool cache = true,
+  }) {
+    final cacheKey = '$privateKey|$publicKey';
+    final cached = _conversationKeys[cacheKey];
+    if (cached != null) return Uint8List.fromList(cached);
+    final sharedSecret = Nip44.computeSharedSecret(privateKey, publicKey);
+    final conversationKey = Nip44.deriveConversationKey(sharedSecret);
+    if (!cache) return conversationKey;
+    if (_conversationKeys.length >= _conversationKeyCacheLimit) {
+      _conversationKeys.clear();
+    }
+    _conversationKeys[cacheKey] = Uint8List.fromList(conversationKey);
+    return conversationKey;
+  }
+
+  /// Drops every cached conversation key derived from [privateKey]. Session
+  /// cleanup calls this so retired trade/chat key material does not outlive
+  /// its session inside the cache.
+  static void evictConversationKeysFor(String privateKey) {
+    _conversationKeys.removeWhere((key, _) => key.startsWith('$privateKey|'));
+  }
+
+  /// Drops the whole conversation-key cache (full session reset / tests).
+  static void clearConversationKeyCache() => _conversationKeys.clear();
+
+  @visibleForTesting
+  static int get conversationKeyCacheSize => _conversationKeys.length;
+
+  @visibleForTesting
+  static bool conversationKeyCacheContains(
+          String privateKey, String publicKey) =>
+      _conversationKeys.containsKey('$privateKey|$publicKey');
 
   static NostrKeyPairs computeSharedKey(String privateKey, String publicKey) {
     final sharedKey = Nip44.computeSharedSecret(privateKey, publicKey);
@@ -348,7 +432,7 @@ class NostrUtils {
     if (recipientPubKey.length != 64) {
       throw ArgumentError('Invalid recipient public key');
     }
-    if (!isValidPrivateKey(senderPrivateKey)) {
+    if (!isCanonicalPrivateKey(senderPrivateKey)) {
       throw ArgumentError('Invalid sender private key');
     }
 
@@ -391,15 +475,17 @@ class NostrUtils {
     if (event.content == null || event.content!.isEmpty) {
       throw ArgumentError('Event content is empty');
     }
-    if (!isValidPrivateKey(privateKey)) {
+    if (!isCanonicalPrivateKey(privateKey)) {
       throw ArgumentError('Invalid private key');
     }
 
     try {
+      // event.pubkey is the sender's one-shot wrapper key; never cache it.
       final decryptedContent = await decryptNIP44(
         event.content!,
         privateKey,
         event.pubkey,
+        cacheConversationKey: false,
       );
 
       final rumorEvent = NostrEvent.deserialized(
@@ -467,7 +553,7 @@ class NostrUtils {
     if (event.content == null || event.content!.isEmpty) {
       throw ArgumentError('Event content is empty');
     }
-    if (!isValidPrivateKey(privateKey)) {
+    if (!isCanonicalPrivateKey(privateKey)) {
       throw ArgumentError('Invalid private key');
     }
     if (event.pubkey != expectedAuthor) {
@@ -475,19 +561,26 @@ class NostrUtils {
         'Unexpected author: expected $expectedAuthor, got ${event.pubkey}',
       );
     }
-    if (!_isValidEventSignature(event)) {
-      throw ArgumentError('Invalid kind-14 event signature');
-    }
-
-    try {
-      return await decryptNIP44(
-        event.content!,
-        privateKey,
-        event.pubkey,
-      );
-    } catch (e) {
-      throw Exception('Failed to decrypt NIP-44 direct event: $e');
-    }
+    // Resolve the cached conversation key on the caller isolate, then run
+    // the heavy part (Schnorr verify + ChaCha20 decrypt, ~15-90 ms of pure
+    // Dart) off the main isolate. Strings/bytes transfer cheaply and thrown
+    // errors propagate.
+    final conversationKey = conversationKeyFor(privateKey, event.pubkey);
+    return Isolate.run(() async {
+      if (!_isValidEventSignature(event)) {
+        throw ArgumentError('Invalid kind-14 event signature');
+      }
+      try {
+        return await Nip44.decryptMessage(
+          event.content!,
+          privateKey,
+          event.pubkey,
+          customConversationKey: conversationKey,
+        );
+      } catch (e) {
+        throw Exception('Failed to decrypt NIP-44 direct event: $e');
+      }
+    });
   }
 
   /// Verifies a Nostr event's id and Schnorr signature (NIP-01): recomputes the
@@ -548,26 +641,46 @@ class NostrUtils {
     return true;
   }
 
+  /// [cacheConversationKey] must be false when either side of the pair is a
+  /// one-shot key (NIP-59 ephemeral wrappers), so the derived key is not
+  /// retained in the static cache.
   static Future<String> encryptNIP44(
     String content,
     String privkey,
-    String pubkey,
-  ) async {
+    String pubkey, {
+    bool cacheConversationKey = true,
+  }) async {
     try {
-      return await Nip44.encryptMessage(content, privkey, pubkey);
+      return await Nip44.encryptMessage(
+        content,
+        privkey,
+        pubkey,
+        customConversationKey:
+            conversationKeyFor(privkey, pubkey, cache: cacheConversationKey),
+      );
     } catch (e) {
       // Handle encryption error appropriately
       throw Exception('Encryption failed: $e');
     }
   }
 
+  /// [cacheConversationKey] must be false when either side of the pair is a
+  /// one-shot key (NIP-59 ephemeral wrappers), so the derived key is not
+  /// retained in the static cache.
   static Future<String> decryptNIP44(
     String encryptedContent,
     String privkey,
-    String pubkey,
-  ) async {
+    String pubkey, {
+    bool cacheConversationKey = true,
+  }) async {
     try {
-      return await Nip44.decryptMessage(encryptedContent, privkey, pubkey);
+      return await Nip44.decryptMessage(
+        encryptedContent,
+        privkey,
+        pubkey,
+        customConversationKey:
+            conversationKeyFor(privkey, pubkey, cache: cacheConversationKey),
+      );
     } catch (e) {
       // Handle encryption error appropriately
       throw Exception('Decryption failed: $e');
